@@ -1,0 +1,19 @@
+name: Build Windows EXE
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pillow pillow-heif pymupdf pywin32 tkinterdnd2 pyinstaller
+      - run: python make_icon.py
+      - run: pyinstaller --onefile --windowed --name Converter --icon icon.ico --collect-all tkinterdnd2 --collect-all pillow_heif --collect-all pymupdf main.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Converter-exe
+          path: dist/Converter.exe
