@@ -2,13 +2,10 @@ name: Build Windows EXE
 on:
   workflow_dispatch:
   push:
-    paths: ["winapp/**", ".github/workflows/windows.yml"]
+    paths: ["main.py", "make_icon.py", ".github/workflows/windows.yml"]
 jobs:
   build:
     runs-on: windows-latest
-    defaults:
-      run:
-        working-directory: winapp
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,5 +16,5 @@ jobs:
       - run: pyinstaller --onefile --windowed --name Converter --icon icon.ico --collect-all tkinterdnd2 --collect-all pillow_heif --collect-all pymupdf main.py
       - uses: actions/upload-artifact@v4
         with:
-          name: Converter-windows-exe
-          path: winapp/dist/Converter.exe
+          name: Converter-exe
+          path: dist/Converter.exe
