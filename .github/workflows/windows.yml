@@ -2,7 +2,7 @@ name: Build Windows EXE
 on:
   workflow_dispatch:
   push:
-    paths: ["main.py", "make_icon.py", "installer.iss", ".github/workflows/windows.yml"]
+    paths: ["main.py", "docrender.py", "passport.py", "embedded_key.py", "make_icon.py", "installer.iss", ".github/workflows/windows.yml"]
 jobs:
   build:
     runs-on: windows-latest
@@ -11,14 +11,26 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install pillow pillow-heif pymupdf pywin32 tkinterdnd2 pyinstaller
-      - name: Embed remove.bg key
-        shell: bash
+      - run: pip install pillow pillow-heif pymupdf pywin32 tkinterdnd2 pyinstaller numpy mediapipe
+      - run: python make_icon.py
+      - name: Embed remove.bg key (optional secret REMOVEBG_KEY)
+        shell: pwsh
         env:
           REMOVEBG_KEY: ${{ secrets.REMOVEBG_KEY }}
-        run: echo "EMBEDDED_KEY = '$REMOVEBG_KEY'" > _embedded_key.py
-      - run: python make_icon.py
-      - run: pyinstaller --onefile --windowed --name Converter --icon icon.ico --collect-all tkinterdnd2 --collect-all pillow_heif --collect-all pymupdf main.py
+        run: |
+          if ($env:REMOVEBG_KEY) {
+            Set-Content -Path embedded_key.py -Value ('KEY = "' + $env:REMOVEBG_KEY.Trim() + '"') -Encoding ascii
+          }
+      - name: Download offline background-removal model
+        shell: pwsh
+        continue-on-error: true
+        run: Invoke-WebRequest -Uri "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite" -OutFile selfie_segmenter.tflite
+      - name: Build EXE
+        shell: pwsh
+        run: |
+          $extra = @()
+          if (Test-Path selfie_segmenter.tflite) { $extra += "--add-data"; $extra += "selfie_segmenter.tflite;." }
+          pyinstaller --onefile --windowed --name Converter --icon icon.ico --collect-all tkinterdnd2 --collect-all pillow_heif --collect-all pymupdf --collect-all mediapipe @extra main.py
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
       - name: Build setup installer
