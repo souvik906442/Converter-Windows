@@ -20,6 +20,9 @@ try:
 except Exception:
     HAVE_DND = False
 
+import docrender
+import passport
+
 JPG, PNG, WEBP, PDF, DOCX = 0, 1, 2, 3, 4
 FORMATS = ["JPG", "PNG", "WebP", "PDF (সব মিলিয়ে একটা)", "DOCX (সব মিলিয়ে একটা)"]
 MODES = ["ছোট করো (এই সাইজের মধ্যে)", "বড় করো (কমপক্ষে এই সাইজ)", "ঠিক এই সাইজ (ছোট/বড় দুটোই)"]
@@ -28,6 +31,7 @@ WORD_EXT = {".doc", ".docx", ".rtf", ".odt"}
 EXCEL_EXT = {".xls", ".xlsx", ".xlsm", ".csv"}
 PPT_EXT = {".ppt", ".pptx"}
 OFFICE_EXT = WORD_EXT | EXCEL_EXT | PPT_EXT
+DOCRENDER_EXT = {".docx", ".xlsx", ".xlsm"}     # Office না থাকলে নিজস্ব অফলাইন রেন্ডার চলে
 ALL_EXT = IMG_EXT | OFFICE_EXT | {".pdf"}
 
 
@@ -258,6 +262,29 @@ def office_to_pdf(p, tmp):
     return Path(out)
 
 
+def doc_pages(p, tmp):
+    """Offline DOCX/XLSX render -> list of temporary PNG pages (no Microsoft Office needed)."""
+    d = Path(tmp) / f"doc_{abs(hash(str(p))) % 100000}"
+    d.mkdir(parents=True, exist_ok=True)
+    files = []
+
+    def sink(im):
+        f = d / f"{len(files):04d}.png"
+        im.save(str(f), "PNG", compress_level=1)
+        files.append(f)
+    docrender.render_file(p, sink)
+    if not files:
+        raise RuntimeError("ফাইলে কিছু পাওয়া যায়নি")
+    return files
+
+
+def file_pages(files):
+    for f in files:
+        with Image.open(str(f)) as im:
+            im.load()
+            yield im.copy()
+
+
 # ---------------- main conversion ----------------
 
 def unique_path(outdir, name, ext):
@@ -355,7 +382,16 @@ def run(files, fmt, target, mode, outdir, say, prog, opts=None):
                     sources.append((base, "pdf", p))
                 elif ext in OFFICE_EXT:
                     say(f"Office দিয়ে PDF করা হচ্ছে: {p.name}")
-                    sources.append((base, "pdf", office_to_pdf(p, tmp)))
+                    try:
+                        sources.append((base, "pdf", office_to_pdf(p, tmp)))
+                    except Exception as oe:
+                        if ext not in DOCRENDER_EXT:
+                            raise
+                        say(f"Office পাওয়া যায়নি — অফলাইন রেন্ডার চলছে: {p.name}")
+                        try:
+                            sources.append((base, "files", doc_pages(p, tmp)))
+                        except Exception as de:
+                            raise RuntimeError(f"{de} (Office: {oe})")
                 else:
                     sources.append((base, "img", p))
             except Exception as e:
@@ -369,6 +405,8 @@ def run(files, fmt, target, mode, outdir, say, prog, opts=None):
                 except Exception as e:
                     counts.append(0)
                     errors.append(f"{p.name}: {e}")
+            elif kind == "files":
+                counts.append(len(p))
             else:
                 counts.append(1)
         total = max(1, sum(counts))
@@ -385,9 +423,11 @@ def run(files, fmt, target, mode, outdir, say, prog, opts=None):
             if n == 0:
                 continue
             try:
-                gen = pdf_pages(p) if kind == "pdf" else image_pages(p, opts)
+                gen = (pdf_pages(p) if kind == "pdf" else
+                       file_pages(p) if kind == "files" else image_pages(p, opts))
+                pname = base if kind == "files" else p.name
                 for i, img in enumerate(gen):
-                    say(f"প্রসেস হচ্ছে: {p.name}" + (f" পাতা {i + 1}/{n}" if n > 1 else ""))
+                    say(f"প্রসেস হচ্ছে: {pname}" + (f" পাতা {i + 1}/{n}" if n > 1 else ""))
                     name = base + (f"_p{i + 1}" if n > 1 else "")
                     if bundle:
                         im = flatten(img)
@@ -406,7 +446,7 @@ def run(files, fmt, target, mode, outdir, say, prog, opts=None):
                     done += 1
                     prog(done, total)
             except Exception as e:
-                errors.append(f"{p.name}: {e}")
+                errors.append(f"{base if kind == 'files' else p.name}: {e}")
         msg = ""
         if bundle:
             if not jpgs:
@@ -466,6 +506,10 @@ def apply_theme(root):
            selectbackground=[("readonly", FIELD)], selectforeground=[("readonly", FG)])
     st.configure("TCheckbutton", background=BG, foreground=FG, indicatorcolor=FIELD)
     st.map("TCheckbutton", background=[("active", BG)], indicatorcolor=[("selected", ACCENT)])
+    st.configure("TRadiobutton", background=BG, foreground=FG, indicatorcolor=FIELD)
+    st.map("TRadiobutton", background=[("active", BG)], indicatorcolor=[("selected", ACCENT)])
+    st.configure("TSpinbox", fieldbackground=FIELD, foreground=FG, insertcolor=FG, bordercolor=BORDER,
+                 arrowcolor=FG, background=FIELD, padding=4)
     st.configure("TScrollbar", background=FIELD, troughcolor=BG, arrowcolor=FG, bordercolor=BG)
     st.configure("Horizontal.TProgressbar", troughcolor=FIELD, background=ACCENT, bordercolor=BORDER,
                  lightcolor=ACCENT, darkcolor=ACCENT)
@@ -783,13 +827,459 @@ class CropDialog:
         self.top.destroy()
 
 
+# ---------------- passport photo tab ----------------
+
+class PassportTab(ttk.Frame):
+    CW, CH = 300, 380
+
+    def __init__(self, app, parent):
+        super().__init__(parent)
+        self.app = app
+        self.cfg = passport.load_cfg()
+        self.src = None            # full photo (PIL RGB)
+        self.view = None           # smaller copy used for fast drawing
+        self.vscale = 1.0
+        self.box = None            # crop frame [x, y, w, h] in photo pixels
+        self.seg = None            # None / "run" / "fail" / (mask, engine)
+        self.seg_gen = 0
+        self.pending = False
+        self.cropped = None
+        self.mask = None
+        self.mask_alpha = False
+        self.final = None
+        self.photo = None
+        self.prev = None
+        self.drag = None
+        self.busy = False
+        self.q = queue.Queue()
+        online = bool(passport.EMBEDDED_KEY) or bool(self.cfg.get("online"))
+        self.size_idx = tk.IntVar(value=0)
+        self.engine = tk.IntVar(value=1 if online else 0)
+        self.key = tk.StringVar(value=self.cfg.get("key", ""))
+        self.bg = tk.IntVar(value=0)
+        self.edge = tk.DoubleVar(value=50.0)
+        self.copies = tk.IntVar(value=21)
+        self.status = tk.StringVar(value="আগে ছবি বাছাই করো (বা ফাইল এখানে ড্র্যাগ করো)")
+        self._build()
+        self.clamp()
+        self.redraw()
+        self.after(100, self._poll)
+
+    # ---- layout
+    def _build(self):
+        left = ttk.Frame(self)
+        left.pack(side="left", fill="y", padx=(10, 5), pady=6)
+        ttk.Button(left, text="ছবি বাছাই করো", style="Blue.TButton", command=self.pick).pack(fill="x", pady=(0, 6))
+        self.cv = tk.Canvas(left, width=self.CW, height=self.CH, bg="#222222", highlightthickness=0)
+        self.cv.pack()
+        self.cv.bind("<ButtonPress-1>", self.on_press)
+        self.cv.bind("<B1-Motion>", self.on_move)
+        self.cv.bind("<MouseWheel>", self.on_wheel)
+        self.cv.bind("<Button-4>", self.on_wheel)
+        self.cv.bind("<Button-5>", self.on_wheel)
+        zr = ttk.Frame(left)
+        zr.pack(fill="x", pady=4)
+        ttk.Button(zr, text="জুম −", command=lambda: self.zoom(1 / 1.15)).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(zr, text="জুম +", command=lambda: self.zoom(1.15)).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Label(left, text="টেনে সরাও, মাউস হুইলে জুম করো।\nমুখ ফ্রেমের মাঝে রাখো।",
+                  wraplength=self.CW, justify="left").pack(anchor="w")
+
+        right = ttk.Frame(self)
+        right.pack(side="left", fill="both", expand=True, padx=(5, 10), pady=6)
+        sf = ttk.LabelFrame(right, text="পাসপোর্ট সাইজ")
+        sf.pack(fill="x")
+        for i, (n, w, h) in enumerate(passport.SIZES):
+            ttk.Radiobutton(sf, text=f"{n}  ({w}×{h} px)", variable=self.size_idx, value=i,
+                            command=self.on_size).pack(anchor="w", padx=6, pady=1)
+
+        ef = ttk.LabelFrame(right, text="ব্যাকগ্রাউন্ড রিমুভ")
+        ef.pack(fill="x", pady=(6, 0))
+        ttk.Radiobutton(ef, text="অফলাইন (কম্পিউটারেই)", variable=self.engine, value=0,
+                        command=self.on_engine).pack(anchor="w", padx=6, pady=1)
+        ttk.Radiobutton(ef, text="অনলাইন (remove.bg — ইন্টারনেট লাগবে)", variable=self.engine, value=1,
+                        command=self.on_engine).pack(anchor="w", padx=6, pady=1)
+        self.key_row = ttk.Frame(ef)
+        if passport.EMBEDDED_KEY:
+            ttk.Label(self.key_row, text="remove.bg key বিল্ডে বসানো আছে", wraplength=330).pack(anchor="w", padx=6)
+        else:
+            kr = ttk.Frame(self.key_row)
+            kr.pack(fill="x", padx=6)
+            ttk.Label(kr, text="API key:").pack(side="left")
+            ttk.Entry(kr, textvariable=self.key).pack(side="left", fill="x", expand=True, padx=4)
+            ttk.Label(self.key_row, text="remove.bg/api থেকে ফ্রি key (মাসে ৫০টা)। একাধিক key কমা দিয়ে লেখা যাবে।",
+                      wraplength=330, justify="left").pack(anchor="w", padx=6, pady=(0, 4))
+        self.on_engine(save=False)
+
+        self.crop_btn = ttk.Button(right, text="ক্রপ করো ➜ ব্যাকগ্রাউন্ড বদলাও", style="Purple.TButton",
+                                   command=self.do_crop)
+        self.crop_btn.pack(fill="x", pady=6)
+
+        rf = ttk.LabelFrame(right, text="রেজাল্ট")
+        rf.pack(fill="x")
+        top = ttk.Frame(rf)
+        top.pack(fill="x", padx=6, pady=4)
+        self.prev_lbl = ttk.Label(top, text="(এখনো নেই)", width=18, anchor="center")
+        self.prev_lbl.pack(side="left")
+        opt = ttk.Frame(top)
+        opt.pack(side="left", padx=8, anchor="n", fill="x", expand=True)
+        ttk.Label(opt, text="ব্যাকগ্রাউন্ড").pack(anchor="w")
+        ttk.Radiobutton(opt, text="সাদা (White)", variable=self.bg, value=0, command=self.refresh).pack(anchor="w")
+        ttk.Radiobutton(opt, text="আকাশি (Sky Blue)", variable=self.bg, value=1, command=self.refresh).pack(anchor="w")
+        ttk.Label(opt, text="কিনারা (শুধু অফলাইন)").pack(anchor="w", pady=(6, 0))
+        self.edge_scale = ttk.Scale(opt, from_=0, to=100, variable=self.edge, command=lambda v: self.refresh())
+        self.edge_scale.pack(fill="x")
+        ttk.Label(opt, text="দাগ থাকলে ডানে, চুল/কাঁধ কাটা গেলে বামে", wraplength=170,
+                  justify="left").pack(anchor="w")
+        cr = ttk.Frame(rf)
+        cr.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(cr, text="A4 শিটে কপি:").pack(side="left")
+        self.spin = ttk.Spinbox(cr, from_=1, to=30, textvariable=self.copies, width=5, command=self.clamp)
+        self.spin.pack(side="left", padx=6)
+        self.spin.bind("<FocusOut>", lambda e: self.clamp())
+        self.spin.bind("<Return>", lambda e: self.clamp())
+        self.max_lbl = ttk.Label(cr, text="")
+        self.max_lbl.pack(side="left")
+
+        sb = ttk.Frame(right)
+        sb.pack(fill="x", pady=(6, 0))
+        self.save_btns = [
+            ttk.Button(sb, text="১টা ফটো সেভ", style="Green.TButton", command=self.save_one),
+            ttk.Button(sb, text="A4 শিট (JPG)", style="Orange.TButton", command=self.save_sheet_jpg),
+            ttk.Button(sb, text="A4 শিট (PDF)", style="Purple.TButton", command=self.save_sheet_pdf),
+        ]
+        for b in self.save_btns:
+            b.pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(right, text="সেভ ফোল্ডার খোলো", command=self.open_dir).pack(fill="x", pady=(6, 0))
+        ttk.Label(right, textvariable=self.status, wraplength=380, justify="left").pack(anchor="w", pady=6)
+        self.set_saveable(False)
+
+    # ---- helpers
+    def psize(self):
+        _, w, h = passport.SIZES[self.size_idx.get()]
+        return w, h
+
+    def aspect(self):
+        w, h = self.psize()
+        return w / h
+
+    def out_dir(self):
+        d = Path(self.app.outdir.get()) / "PassportPhoto"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def set_saveable(self, on):
+        for b in self.save_btns:
+            b.state(["!disabled"] if on else ["disabled"])
+
+    def set_busy(self, on):
+        self.busy = on
+        self.crop_btn.state(["disabled"] if on else ["!disabled"])
+
+    def clamp(self):
+        pw, ph = self.psize()
+        mx = passport.max_copies(pw, ph)
+        try:
+            v = int(self.copies.get())
+        except (ValueError, tk.TclError):
+            v = 1
+        self.copies.set(max(1, min(v, mx)))
+        self.spin.config(to=mx)
+        self.max_lbl.config(text=f"(সর্বোচ্চ {mx})")
+
+    def clear_result(self):
+        self.cropped = self.mask = self.final = None
+        self.mask_alpha = False
+        self.prev = None
+        self.prev_lbl.config(image="", text="(এখনো নেই)")
+        self.set_saveable(False)
+
+    # ---- image loading
+    def pick(self):
+        pats = " ".join("*" + x for x in sorted(IMG_EXT))
+        f = filedialog.askopenfilename(filetypes=[("ছবি", pats), ("সব ফাইল", "*.*")])
+        if f:
+            self.load(f)
+
+    def load(self, path):
+        try:
+            im = Image.open(str(path))
+            im = ImageOps.exif_transpose(im).convert("RGB")
+        except Exception as e:
+            messagebox.showinfo("Converter", f"ছবি খোলা যায়নি: {e}")
+            return
+        if max(im.size) > 4000:
+            im.thumbnail((4000, 4000), Image.LANCZOS)
+        self.src = im
+        v = im.copy()
+        v.thumbnail((1600, 1600), Image.BILINEAR)
+        self.view = v
+        self.vscale = v.width / im.width
+        self.box = passport.init_box(im.width, im.height, self.aspect())
+        self.seg_gen += 1
+        self.seg = None
+        self.pending = False
+        self.set_busy(False)
+        self.clear_result()
+        self.status.set(f"ছবি: {im.width} × {im.height} px — মুখ ফ্রেমের মাঝে এনে ক্রপ করো")
+        self.redraw()
+        if self.engine.get() == 0:
+            self.start_seg()
+
+    # ---- crop frame drawing / mouse
+    def geometry(self):
+        a, pad = self.aspect(), 14
+        aw, ah = self.CW - 2 * pad, self.CH - 2 * pad
+        if aw / ah > a:
+            fh = ah
+            fw = fh * a
+        else:
+            fw = aw
+            fh = fw / a
+        return (self.CW - fw) / 2, (self.CH - fh) / 2, fw, fh
+
+    def redraw(self):
+        c = self.cv
+        c.delete("all")
+        if self.src is None:
+            c.create_text(self.CW / 2, self.CH / 2, text="ছবি বাছাই করো\n(বা ফাইল এখানে ড্র্যাগ করো)",
+                          fill="#aaaaaa", justify="center", font=(FONT, 11))
+            return
+        fx0, fy0, fw, fh = self.geometry()
+        x, y, w, h = self.box
+        k = fw / w                                   # canvas px per photo px
+        iw, ih = self.src.size
+        ix0, iy0 = max(0.0, x - fx0 / k), max(0.0, y - fy0 / k)
+        ix1, iy1 = min(float(iw), x + (self.CW - fx0) / k), min(float(ih), y + (self.CH - fy0) / k)
+        if ix1 > ix0 and iy1 > iy0:
+            vs = self.vscale
+            vb = (ix0 * vs, iy0 * vs, min(self.view.width, ix1 * vs), min(self.view.height, iy1 * vs))
+            dw, dh = max(1, round((ix1 - ix0) * k)), max(1, round((iy1 - iy0) * k))
+            self.photo = ImageTk.PhotoImage(self.view.resize((dw, dh), Image.BILINEAR, box=vb))
+            c.create_image(fx0 + (ix0 - x) * k, fy0 + (iy0 - y) * k, anchor="nw", image=self.photo)
+        for r in ((0, 0, self.CW, fy0), (0, fy0 + fh, self.CW, self.CH), (0, fy0, fx0, fy0 + fh),
+                  (fx0 + fw, fy0, self.CW, fy0 + fh)):
+            c.create_rectangle(*r, fill="black", stipple="gray50", outline="")
+        c.create_rectangle(fx0, fy0, fx0 + fw, fy0 + fh, outline="white", width=2)
+        cx, cy = fx0 + fw / 2, fy0 + fh * 0.42
+        c.create_oval(cx - fw * 0.28, cy - fh * 0.30, cx + fw * 0.28, cy + fh * 0.30, outline=ACCENT, dash=(4, 4))
+
+    def on_press(self, e):
+        self.drag = (e.x, e.y)
+
+    def on_move(self, e):
+        if self.src is None or self.drag is None:
+            return
+        _, _, fw, _ = self.geometry()
+        k = fw / self.box[2]
+        b = list(self.box)
+        b[0] -= (e.x - self.drag[0]) / k
+        b[1] -= (e.y - self.drag[1]) / k
+        self.box = passport.clamp_box(b, *self.src.size, self.aspect())
+        self.drag = (e.x, e.y)
+        self.redraw()
+
+    def on_wheel(self, e):
+        if self.src is None:
+            return
+        up = getattr(e, "num", 0) == 4 or getattr(e, "delta", 0) > 0
+        fx0, fy0, fw, fh = self.geometry()
+        fx = min(1.0, max(0.0, (e.x - fx0) / fw))
+        fy = min(1.0, max(0.0, (e.y - fy0) / fh))
+        self.zoom(1.1 if up else 1 / 1.1, fx, fy)
+
+    def zoom(self, f, fx=0.5, fy=0.5):
+        if self.src is None:
+            return
+        self.box = passport.zoom_box(self.box, f, *self.src.size, self.aspect(), fx, fy)
+        self.redraw()
+
+    # ---- options
+    def on_size(self):
+        self.clear_result()
+        if self.src is not None:
+            x, y, w, h = self.box
+            a = self.aspect()
+            nw = min(w, passport.max_box_w(*self.src.size, a))
+            self.box = passport.clamp_box([x + w / 2 - nw / 2, y + h / 2 - nw / a / 2, nw, nw / a], *self.src.size, a)
+        self.clamp()
+        self.redraw()
+
+    def on_engine(self, save=True):
+        if self.engine.get() == 1:
+            self.key_row.pack(fill="x", pady=(0, 2))
+        else:
+            self.key_row.pack_forget()
+        if save:
+            self.cfg["online"] = self.engine.get() == 1
+            passport.save_cfg(self.cfg)
+            if self.engine.get() == 0 and self.src is not None and self.seg is None:
+                self.start_seg()
+
+    # ---- background removal
+    def start_seg(self):
+        self.seg = "run"
+        gen, src = self.seg_gen, self.src
+        self.status.set("ব্যাকগ্রাউন্ড বিশ্লেষণ চলছে…")
+
+        def work():
+            try:
+                res = passport.offline_mask(src)
+            except Exception as e:
+                res = e
+            self.q.put(("seg", gen, res))
+        threading.Thread(target=work, daemon=True).start()
+
+    def do_crop(self):
+        if self.src is None:
+            messagebox.showinfo("Converter", "আগে ছবি বাছাই করো")
+            return
+        if self.engine.get() == 1:
+            self.online_crop()
+            return
+        if self.seg is None:
+            self.start_seg()
+        if self.seg == "run":
+            self.pending = True
+            self.set_busy(True)
+            self.status.set("একটু অপেক্ষা করো, ব্যাকগ্রাউন্ড বিশ্লেষণ চলছে…")
+            return
+        pw, ph = self.psize()
+        box = list(self.box)
+        self.cropped = passport.crop_image(self.src, box, pw, ph)
+        self.mask, self.mask_alpha = None, False
+        if isinstance(self.seg, tuple):
+            self.mask = passport.crop_mask(self.seg[0], self.src.size, box, pw, ph)
+        self.finish()
+
+    def online_crop(self):
+        keys = passport.split_keys(passport.EMBEDDED_KEY or self.key.get())
+        if not keys:
+            messagebox.showinfo("Converter", "আগে remove.bg API key বসাও")
+            return
+        if not passport.EMBEDDED_KEY:
+            self.cfg["key"] = self.key.get().strip()
+            passport.save_cfg(self.cfg)
+        pw, ph = self.psize()
+        cropped = passport.crop_image(self.src, list(self.box), pw, ph)
+        start, gen = int(self.cfg.get("kidx", 0) or 0), self.seg_gen
+        self.set_busy(True)
+        self.status.set("remove.bg-তে পাঠানো হচ্ছে…")
+
+        def work():
+            try:
+                res = passport.remove_bg_with_keys(cropped, keys, start)
+            except Exception as e:
+                res = e
+            self.q.put(("online", gen, res, cropped))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll(self):
+        try:
+            while True:
+                ev = self.q.get_nowait()
+                if ev[1] != self.seg_gen:
+                    continue
+                if ev[0] == "seg":
+                    res = ev[2]
+                    if isinstance(res, Exception):
+                        self.seg = "fail"
+                        self.status.set(f"ব্যাকগ্রাউন্ড আলাদা করা যায়নি, শুধু ক্রপ হবে ({res})")
+                    else:
+                        self.seg = res
+                        self.status.set("ব্যাকগ্রাউন্ড বিশ্লেষণ শেষ" +
+                                        (" (সরল মোড — মডেল ফাইল পাওয়া যায়নি, মান কম হতে পারে)" if res[1] == "grabcut" else ""))
+                    if self.pending:
+                        self.pending = False
+                        self.set_busy(False)
+                        self.do_crop()
+                elif ev[0] == "online":
+                    res = ev[2]
+                    self.set_busy(False)
+                    if isinstance(res, Exception):
+                        self.status.set(f"অনলাইন ব্যর্থ: {res}")
+                        messagebox.showinfo("Converter", f"অনলাইন ব্যর্থ: {res}")
+                    else:
+                        self.cfg["kidx"] = res[1]
+                        passport.save_cfg(self.cfg)
+                        self.cropped, self.mask, self.mask_alpha = ev[3], res[0], True
+                        self.finish()
+        except queue.Empty:
+            pass
+        self.after(100, self._poll)
+
+    # ---- result
+    def finish(self):
+        self.set_busy(False)
+        self.refresh()
+        self.clamp()
+        self.status.set("ক্রপ হয়েছে — ব্যাকগ্রাউন্ড বেছে সেভ করো")
+
+    def refresh(self):
+        if self.cropped is None:
+            return
+        use_edge = self.mask is not None and not self.mask_alpha
+        self.edge_scale.state(["!disabled"] if use_edge else ["disabled"])
+        if self.mask is None:
+            self.final = self.cropped
+        else:
+            self.final = passport.composite(self.cropped, self.mask, passport.SKY if self.bg.get() == 1 else passport.WHITE,
+                                            int(float(self.edge.get())), self.mask_alpha)
+        pv = self.final.copy()
+        pv.thumbnail((140, 180), Image.BILINEAR)
+        self.prev = ImageTk.PhotoImage(pv)
+        self.prev_lbl.config(image=self.prev, text="")
+        self.set_saveable(True)
+
+    # ---- saving
+    def _stamp(self):
+        return time.strftime("%Y%m%d_%H%M%S")
+
+    def _guard(self, fn):
+        if self.final is None:
+            messagebox.showinfo("Converter", "আগে ক্রপ করো")
+            return
+        try:
+            self.clamp()
+            p = fn()
+            self.status.set(f"সেভ হয়েছে: {p}")
+        except Exception as e:
+            self.status.set(f"সেভ করা যায়নি: {e}")
+            messagebox.showinfo("Converter", f"সেভ করা যায়নি: {e}")
+
+    def save_one(self):
+        def fn():
+            p = unique_path(self.out_dir(), "passport_" + self._stamp(), "jpg")
+            passport.save_jpeg(self.final, p)
+            return p
+        self._guard(fn)
+
+    def save_sheet_jpg(self):
+        def fn():
+            p = unique_path(self.out_dir(), "passport_sheet_" + self._stamp(), "jpg")
+            passport.save_jpeg(passport.build_sheet(self.final, int(self.copies.get())), p)
+            return p
+        self._guard(fn)
+
+    def save_sheet_pdf(self):
+        def fn():
+            p = unique_path(self.out_dir(), "passport_sheet_" + self._stamp(), "pdf")
+            passport.save_pdf(passport.build_sheet(self.final, int(self.copies.get())), p)
+            return p
+        self._guard(fn)
+
+    def open_dir(self):
+        os.startfile(str(self.out_dir()))
+
+
 # ---------------- GUI ----------------
 
 class App:
     def __init__(self, root):
         self.root = root
         root.title("Offline Converter")
-        root.geometry("740x900")
+        sh = root.winfo_screenheight()
+        root.geometry(f"740x{min(900, max(560, sh - 90))}")   # টাস্কবারের নিচে ঢাকা পড়বে না
+        root.minsize(700, 520)
         try:
             for nm in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
                 tkfont.nametofont(nm).configure(family="Nirmala UI", size=10)
@@ -809,8 +1299,25 @@ class App:
         hd.create_text(18, 29, anchor="w", text="Offline Converter", fill="white", font=(FONT, 18, "bold"), tags="title")
         hd.bind("<Configure>", lambda ev: (draw_gradient(hd, ev.width, 58), hd.tag_raise("title")))
 
-        ttk.Label(root, text="ফাইল বাছাই করো (ছবি / PDF / Word / Excel / PowerPoint) — ড্র্যাগ করেও ফেলতে পারো").pack(anchor="w", **P)
-        fr = ttk.Frame(root)
+        self.tab = 0
+        tabs = tk.Frame(root, bg=BG)
+        tabs.pack(fill="x", pady=(6, 0))
+        self.tab_lbls = []
+        for i, t in enumerate(("Converter", "পাসপোর্ট ফটো")):
+            lb = tk.Label(tabs, text=t, font=(FONT, 11, "bold"), pady=6, cursor="hand2")
+            lb.pack(side="left", fill="x", expand=True, padx=(10, 3) if i == 0 else (3, 10))
+            lb.bind("<Button-1>", lambda ev, i=i: self.switch(i))
+            self.tab_lbls.append(lb)
+        conv = ttk.Frame(root)
+        conv.pack(fill="both", expand=True)
+        self.conv = conv
+        self.pp = PassportTab(self, root)
+        anchor = ttk.Frame(conv, height=1)
+        anchor.pack()
+        self.switch(0)
+
+        ttk.Label(conv, text="ফাইল বাছাই করো (ছবি / PDF / Word / Excel / PowerPoint) — ড্র্যাগ করেও ফেলতে পারো").pack(anchor="w", **P)
+        fr = ttk.Frame(conv)
         fr.pack(fill="both", expand=True, **P)
         self.lb = tk.Listbox(fr, height=8, selectmode="extended", bg=FIELD, fg=FG, selectbackground="#8E2DE2",
                              selectforeground="white", highlightthickness=1, highlightbackground=BORDER, relief="flat", bd=0)
@@ -819,7 +1326,7 @@ class App:
         self.lb.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
-        bf = ttk.Frame(root)
+        bf = ttk.Frame(conv)
         bf.pack(fill="x", **P)
         ttk.Button(bf, text="ফাইল যোগ করো", style="Blue.TButton", command=self.add_dialog).pack(side="left", padx=2)
         ttk.Button(bf, text="ফোল্ডার যোগ করো", style="Blue.TButton", command=self.add_folder).pack(side="left", padx=2)
@@ -828,25 +1335,25 @@ class App:
         self.count = ttk.Label(bf, text="০টি ফাইল")
         self.count.pack(side="right")
 
-        ttk.Label(root, text="আউটপুট ফরম্যাট:").pack(anchor="w", **P)
-        self.fmt = ttk.Combobox(root, values=FORMATS, state="readonly")
+        ttk.Label(conv, text="আউটপুট ফরম্যাট:").pack(anchor="w", **P)
+        self.fmt = ttk.Combobox(conv, values=FORMATS, state="readonly")
         self.fmt.current(0)
         self.fmt.pack(fill="x", **P)
 
-        ttk.Label(root, text="সাইজ লিমিট (খালি রাখলে লিমিট নেই):").pack(anchor="w", **P)
-        sf = ttk.Frame(root)
+        ttk.Label(conv, text="সাইজ লিমিট (খালি রাখলে লিমিট নেই):").pack(anchor="w", **P)
+        sf = ttk.Frame(conv)
         sf.pack(fill="x", **P)
         ttk.Entry(sf, textvariable=self.size, width=14).pack(side="left")
         self.unit = ttk.Combobox(sf, values=["KB", "MB"], state="readonly", width=6)
         self.unit.current(0)
         self.unit.pack(side="left", padx=6)
 
-        ttk.Label(root, text="সাইজ মোড:").pack(anchor="w", **P)
-        self.mode = ttk.Combobox(root, values=MODES, state="readonly")
+        ttk.Label(conv, text="সাইজ মোড:").pack(anchor="w", **P)
+        self.mode = ttk.Combobox(conv, values=MODES, state="readonly")
         self.mode.current(0)
         self.mode.pack(fill="x", **P)
 
-        ef = ttk.Frame(root)
+        ef = ttk.Frame(conv)
         ef.pack(fill="x", **P)
         cf = ttk.LabelFrame(ef, text="ক্রপ / ঘোরানো / ফ্লিপ (শুধু ছবি, pixel হিসাবে)")
         cf.pack(side="left", fill="both", expand=True, padx=(0, 4))
@@ -872,19 +1379,25 @@ class App:
         ttk.Button(pf, text="পিক্সেল বাদ দাও", command=self.clear_px).pack(anchor="w", padx=6, pady=4)
         self.update_crop_lbl()
 
-        ttk.Label(root, text="আউটপুট ফোল্ডার:").pack(anchor="w", **P)
-        of = ttk.Frame(root)
+        out_lbl = ttk.Label(conv, text="আউটপুট ফোল্ডার:")
+        out_lbl.pack(anchor="w", **P)
+        of = ttk.Frame(conv)
         of.pack(fill="x", **P)
         ttk.Entry(of, textvariable=self.outdir).pack(side="left", fill="x", expand=True)
         ttk.Button(of, text="বদলাও", command=self.pick_out).pack(side="left", padx=4)
         ttk.Button(of, text="খোলো", style="Green.TButton", command=self.open_out).pack(side="left")
 
-        self.btn = ttk.Button(root, text="কনভার্ট করো", style="Big.TButton", command=self.start)
+        self.btn = ttk.Button(conv, text="কনভার্ট করো", style="Big.TButton", command=self.start)
         self.btn.pack(fill="x", padx=10, pady=8)
-        self.bar = ttk.Progressbar(root, mode="determinate")
+        self.bar = ttk.Progressbar(conv, mode="determinate")
         self.bar.pack(fill="x", **P)
-        self.status = ttk.Label(root, text="প্রস্তুত", wraplength=660, justify="left")
+        self.status = ttk.Label(conv, text="প্রস্তুত", wraplength=660, justify="left")
         self.status.pack(anchor="w", **P)
+
+        # জানালা ছোট হলেও "কনভার্ট করো" বাটন, প্রগ্রেস বার ও স্ট্যাটাস যেন কখনো ঢাকা না পড়ে —
+        # এগুলো আগে নিচে আটকে দেওয়া হলো (নিচ থেকে উপরে: status, bar, btn, ফোল্ডার সারি, লেবেল)
+        for w in (self.status, self.bar, self.btn, of, out_lbl):
+            w.pack_configure(side="bottom", before=anchor)
 
         if HAVE_DND and hasattr(root, "drop_target_register"):
             try:
@@ -914,7 +1427,25 @@ class App:
             self.reset_edit()
 
     def on_drop(self, e):
-        self.add_paths(self.root.tk.splitlist(e.data))
+        paths = self.root.tk.splitlist(e.data)
+        if self.tab == 1:
+            for p in paths:
+                if Path(p).suffix.lower() in IMG_EXT:
+                    self.pp.load(p)
+                    break
+        else:
+            self.add_paths(paths)
+
+    def switch(self, i):
+        self.tab = i
+        for j, lb in enumerate(self.tab_lbls):
+            lb.config(bg=ACCENT if j == i else FIELD, fg="#1A1446" if j == i else FG)
+        if i == 0:
+            self.pp.pack_forget()
+            self.conv.pack(fill="both", expand=True)
+        else:
+            self.conv.pack_forget()
+            self.pp.pack(fill="both", expand=True)
 
     def add_dialog(self):
         pats = " ".join("*" + x for x in sorted(ALL_EXT))
